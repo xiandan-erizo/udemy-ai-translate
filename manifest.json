@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Udemy Subtitle Translator",
+  "description": "Translates Udemy subtitles in place via OpenAI.",
+  "version": "0.1.0",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.udemy.com/*",
+    "https://api.openai.com/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.udemy.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Udemy Subtitle Translator Settings</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="options.css" />
+    <script defer src="options.js"></script>
+  </head>
+  <body>
+    <main class="page">
+      <header>
+        <h1>Udemy Subtitle Translator</h1>
+        <p>Configure how subtitles are translated and displayed on Udemy.</p>
+      </header>
+
+      <form id="options-form" class="panel">
+        <section class="section">
+          <h2>OpenAI Access</h2>
+          <label class="field">
+            <span class="field__label">OpenAI API Key</span>
+            <input
+              type="password"
+              id="apiKey"
+              name="apiKey"
+              placeholder="sk-..."
+              autocomplete="off"
+              required
+            />
+            <small class="field__help">
+              Your key is stored locally in Chrome and used only for translation requests.
+            </small>
+          </label>
+          <label class="field">
+            <span class="field__label">API Base URL</span>
+            <input
+              type="url"
+              id="apiBaseUrl"
+              name="apiBaseUrl"
+              placeholder="https://api.openai.com"
+              required
+            />
+            <small class="field__help">
+              Customize if you are using a proxy or Azure OpenAI endpoint. Leave it as the host to call <code>/v1/chat/completions</code>, or provide a full endpoint path if required.
+            </small>
+          </label>
+          <button type="button" id="clear-key" class="ghost">Remove Stored Key</button>
+        </section>
+
+        <section class="section">
+          <h2>Translation Settings</h2>
+          <label class="field">
+            <span class="field__label">Model</span>
+            <input
+              type="text"
+              id="model"
+              name="model"
+              placeholder="gpt-4o-mini"
+              required
+            />
+            <small class="field__help">
+              Provide the model ID available on your account (e.g., gpt-4o-mini, gpt-4o, o1-mini).
+            </small>
+          </label>
+          <label class="field">
+            <span class="field__label">Target Language</span>
+            <input
+              type="text"
+              id="targetLanguage"
+              name="targetLanguage"
+              placeholder="zh-CN"
+              required
+            />
+            <small class="field__help">Use any language code or name you prefer.</small>
+          </label>
+
+          <label class="field field--checkbox">
+            <input type="checkbox" id="showOriginal" name="showOriginal" />
+            <span>Show original subtitles along with translations</span>
+          </label>
+
+          <label class="field field--checkbox">
+            <input type="checkbox" id="translateTranscript" name="translateTranscript" />
+            <span>Translate transcript panel entries</span>
+          </label>
+
+          <label class="field">
+            <span class="field__label">Concurrent Requests</span>
+            <input
+              type="number"
+              id="concurrencyLimit"
+              name="concurrencyLimit"
+              min="1"
+              max="8"
+              step="1"
+              required
+            />
+            <small class="field__help">
+              Controls how many subtitle lines are translated at the same time. Increase sparingly to avoid hitting rate limits.
+            </small>
+          </label>
+        </section>
+
+        <section class="section">
+          <h2>Appearance</h2>
+          <label class="field">
+            <span class="field__label">Caption Font Size</span>
+            <input
+              type="text"
+              id="captionFontSize"
+              name="captionFontSize"
+              placeholder="2.4rem"
+              required
+            />
+            <small class="field__help">
+              Accepts any CSS length value, e.g. <code>2.4rem</code>, <code>28px</code>, or <code>150%</code>.
+            </small>
+          </label>
+
+          <label class="field">
+            <span class="field__label">Caption Color</span>
+            <input
+              type="color"
+              id="captionColor"
+              name="captionColor"
+              value="#b5e3ff"
+            />
+            <small class="field__help">
+              Used for translated captions rendered on top of the video. Transcript translations remain smaller and green.
+            </small>
+          </label>
+        </section>
+
+        <footer class="actions">
+          <button type="submit" class="primary">Save Settings</button>
+          <button type="button" id="clear-cache" class="ghost">Clear Translation Cache</button>
+          <span id="status" role="status" aria-live="polite"></span>
+        </footer>
+      </form>
+    </main>
+  </body>
+</html>
