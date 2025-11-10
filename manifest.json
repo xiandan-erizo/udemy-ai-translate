@@ -20,7 +20,7 @@
         "https://www.udemy.com/*"
       ],
       "js": [
-        "content.js"
+        "assets/content.js"
       ],
       "run_at": "document_idle"
     }

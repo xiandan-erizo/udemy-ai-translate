@@ -17,6 +17,9 @@ const LOCAL_DEFAULTS = {
 const CACHE_STORAGE_KEY = 'udemyTranslator.cache';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const CACHE_SAVE_DEBOUNCE_MS = 2000;
+const TRANSLATION_TIMEOUT_MS = 45000;
+const TRANSLATION_MAX_RETRIES = 3;
+const TRANSLATION_RETRY_DELAY_MS = 800;
 
 const translationCache = new Map(); // key -> { translation, timestamp }
 const pendingRequests = new Map();
@@ -139,65 +142,87 @@ async function getSettings() {
 }
 
 async function translateText({ text, apiKey, targetLanguage, apiBaseUrl, model, context }) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= TRANSLATION_MAX_RETRIES; attempt++) {
+    try {
+      return await performTranslationRequest({ text, apiKey, targetLanguage, apiBaseUrl, model, context });
+    } catch (error) {
+      lastError = error;
+      const shouldRetry = isRetryableTranslationError(error) && attempt < TRANSLATION_MAX_RETRIES;
+      if (!shouldRetry) {
+        throw normalizeTranslationError(error);
+      }
+      await delay(TRANSLATION_RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw normalizeTranslationError(lastError);
+}
+
+async function performTranslationRequest({ text, apiKey, targetLanguage, apiBaseUrl, model, context }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort('REQUEST_TIMEOUT'), TRANSLATION_TIMEOUT_MS);
 
-  const contextLines = Array.isArray(context) ? context.filter(Boolean) : [];
-  const contextBlock = contextLines.length ? `Context:\n${contextLines.join('\n')}\n\n` : '';
-  const prompt = `Translate the following subtitle line into ${targetLanguage}. Provide translation only.\n\n${contextBlock}Subtitle:\n${text}`;
+  try {
+    const contextLines = Array.isArray(context) ? context.filter(Boolean) : [];
+    const contextBlock = contextLines.length ? `Context:\n${contextLines.join('\n')}\n\n` : '';
+    const prompt = `Translate the following subtitle line into ${targetLanguage}. Provide translation only.\n\n${contextBlock}Subtitle:\n${text}`;
 
-  let endpoint = (apiBaseUrl || 'https://api.openai.com').trim();
-  if (!/^https?:\/\//i.test(endpoint)) {
-    endpoint = 'https://api.openai.com';
+    let endpoint = (apiBaseUrl || 'https://api.openai.com').trim();
+    if (!/^https?:\/\//i.test(endpoint)) {
+      endpoint = 'https://api.openai.com';
+    }
+    endpoint = endpoint.replace(/\/+$/, '');
+    if (/\/(chat\/completions|responses)(?:\/|$)/i.test(endpoint)) {
+      // already points to a full endpoint such as /v1/chat/completions or /v1/responses
+    } else if (/\/v\d+$/i.test(endpoint)) {
+      endpoint = `${endpoint}/chat/completions`;
+    } else {
+      endpoint = `${endpoint}/v1/chat/completions`;
+    }
+    const modelName = model || 'gpt-4o-mini';
+
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a precise subtitle translator. Keep timing subtleties and concise language. Avoid adding commentary.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.2,
+        max_tokens: 200
+      }),
+      thinking: {
+        type: 'disabled'
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const errorPayload = await safeJson(response);
+      const reason = errorPayload?.error?.message || response.statusText || 'REQUEST_FAILED';
+      throw new Error(reason);
+    }
+
+    const data = await response.json();
+    const translated = data?.choices?.[0]?.message?.content?.trim();
+    if (!translated) {
+      throw new Error('EMPTY_TRANSLATION');
+    }
+    return translated;
+  } finally {
+    clearTimeout(timeout);
   }
-  endpoint = endpoint.replace(/\/+$/, '');
-  if (/\/(chat\/completions|responses)(?:\/|$)/i.test(endpoint)) {
-    // already points to a full endpoint such as /v1/chat/completions or /v1/responses
-  } else if (/\/v\d+$/i.test(endpoint)) {
-    endpoint = `${endpoint}/chat/completions`;
-  } else {
-    endpoint = `${endpoint}/v1/chat/completions`;
-  }
-  const modelName = model || 'gpt-4o-mini';
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: modelName,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a precise subtitle translator. Keep timing subtleties and concise language. Avoid adding commentary.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      temperature: 0.2,
-      max_tokens: 200
-    }),
-    signal: controller.signal
-  });
-
-  clearTimeout(timeout);
-
-  if (!response.ok) {
-    const errorPayload = await safeJson(response);
-    const reason = errorPayload?.error?.message || response.statusText || 'REQUEST_FAILED';
-    throw new Error(reason);
-  }
-
-  const data = await response.json();
-  const translated = data?.choices?.[0]?.message?.content?.trim();
-  if (!translated) {
-    throw new Error('EMPTY_TRANSLATION');
-  }
-  return translated;
 }
 
 async function safeJson(response) {
@@ -347,4 +372,33 @@ async function clearTranslationCache() {
     cacheSaveTimer = null;
   }
   await chrome.storage.local.remove(CACHE_STORAGE_KEY);
+}
+
+function isRetryableTranslationError(error) {
+  if (!error) return false;
+  if (error.name === 'AbortError') {
+    return true;
+  }
+  const message = String(error.message || '').toLowerCase();
+  return (
+    message.includes('network') ||
+    message.includes('timeout') ||
+    message.includes('temporarily unavailable') ||
+    message.includes('rate limit') ||
+    message.includes('fetch')
+  );
+}
+
+function normalizeTranslationError(error) {
+  if (!error) {
+    return new Error('TRANSLATION_FAILED');
+  }
+  if (error.name === 'AbortError' || String(error.message || '').toLowerCase().includes('aborted')) {
+    return new Error('REQUEST_TIMEOUT');
+  }
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
