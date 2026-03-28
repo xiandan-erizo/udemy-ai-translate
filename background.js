@@ -1,404 +1,141 @@
 const SYNC_DEFAULTS = {
   targetLanguage: 'zh-CN',
-  displayMode: 'stacked',
   showOriginal: true,
   translateTranscript: true,
   apiBaseUrl: 'https://api.openai.com',
   model: 'gpt-4o-mini',
   concurrencyLimit: 3,
   captionFontSize: '2.4rem',
-  captionColor: '#b5e3ff'
+  captionColor: '#b5e3ff',
+  customHeaders: '',
+  enableThinking: false
 };
 
-const LOCAL_DEFAULTS = {
-  apiKey: ''
-};
+const LOCAL_DEFAULTS = { apiKey: '' };
 
-const CACHE_STORAGE_KEY = 'udemyTranslator.cache';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const CACHE_SAVE_DEBOUNCE_MS = 2000;
-const TRANSLATION_TIMEOUT_MS = 45000;
-const TRANSLATION_MAX_RETRIES = 3;
-const TRANSLATION_RETRY_DELAY_MS = 800;
+const CACHE_KEY = 'udemyTranslator.cache';
+const CACHE_TTL = 24 * 60 * 60 * 1000;
 
-const translationCache = new Map(); // key -> { translation, timestamp }
-const pendingRequests = new Map();
-const jobQueue = [];
+const cache = new Map();
+const pending = new Map();
+const queue = [];
+let activeJobs = 0, maxJobs = 3, cacheLoaded = false;
 
-let activeJobs = 0;
-let currentConcurrency = sanitizeConcurrency(SYNC_DEFAULTS.concurrencyLimit);
-let cacheInitialized = false;
-let cacheSaveTimer = null;
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === 'translate') {
-    handleTranslateRequest(message, sendResponse);
+chrome.runtime.onMessage.addListener((msg, sender, send) => {
+  if (msg?.type === 'translate') {
+    handleTranslate(msg, send);
     return true;
   }
-
-  if (message?.type === 'clear-cache') {
-    clearTranslationCache()
-      .then(() => sendResponse({ success: true }))
-      .catch(error => {
-        sendResponse({ success: false, error: error.message || 'CLEAR_FAILED' });
-      });
+  if (msg?.type === 'clear-cache') {
+    cache.clear();
+    chrome.storage.local.remove(CACHE_KEY).then(() => send({ success: true }));
     return true;
   }
-
-  return false;
 });
 
-async function handleTranslateRequest(message, sendResponse) {
-  try {
-    const { text, context } = message;
-    if (!text || !text.trim()) {
-      sendResponse({ success: false, error: 'EMPTY_TEXT' });
-      return;
-    }
+async function handleTranslate(msg, send) {
+  const text = msg.text?.trim();
+  if (!text) return send({ success: false, error: 'EMPTY_TEXT' });
 
-    const settings = await getSettings();
-    if (!settings.apiKey) {
-      sendResponse({ success: false, error: 'MISSING_API_KEY' });
-      return;
-    }
+  const s = await getSettings();
+  if (!s.apiKey) return send({ success: false, error: 'MISSING_API_KEY' });
 
-    await ensureCacheLoaded();
+  await loadCache();
+  maxJobs = clamp(s.concurrencyLimit, 1, 8);
 
-    const sanitizedConcurrency = sanitizeConcurrency(settings.concurrencyLimit);
-    settings.concurrencyLimit = sanitizedConcurrency;
-    updateConcurrency(sanitizedConcurrency);
-
-    const cacheKey = buildCacheKey({
-      text,
-      targetLanguage: settings.targetLanguage,
-      model: settings.model,
-      apiBaseUrl: settings.apiBaseUrl
-    });
-
-    const cachedTranslation = getCachedTranslation(cacheKey);
-    if (cachedTranslation) {
-      sendResponse({ success: true, translatedText: cachedTranslation, settings });
-      return;
-    }
-
-    if (pendingRequests.has(cacheKey)) {
-      pendingRequests
-        .get(cacheKey)
-        .then(result => sendResponse(result))
-        .catch(err => {
-          sendResponse({ success: false, error: err.message });
-        });
-      return;
-    }
-
-    const contextLines = Array.isArray(context)
-      ? context.map(line => (typeof line === 'string' ? line.trim() : '')).filter(Boolean).slice(-5)
-      : [];
-
-    const jobPromise = new Promise((resolve, reject) => {
-      enqueueJob({
-        text,
-        context: contextLines,
-        apiKey: settings.apiKey,
-        targetLanguage: settings.targetLanguage,
-        apiBaseUrl: settings.apiBaseUrl,
-        model: settings.model,
-        resolve,
-        reject
-      });
-    }).then(translatedText => {
-      rememberCacheEntry(cacheKey, translatedText);
-      return { success: true, translatedText, settings };
-    });
-
-    pendingRequests.set(cacheKey, jobPromise);
-
-    jobPromise
-      .then(result => {
-        sendResponse(result);
-      })
-      .catch(error => {
-        sendResponse({ success: false, error: error.message || 'TRANSLATION_FAILED' });
-      })
-      .finally(() => {
-        pendingRequests.delete(cacheKey);
-      });
-  } catch (error) {
-    sendResponse({ success: false, error: error.message || 'UNKNOWN_ERROR' });
+  const key = `${s.targetLanguage}::${s.model}::${text}`;
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) {
+    return send({ success: true, translatedText: cached.text, settings: s });
   }
+
+  if (pending.has(key)) {
+    return pending.get(key).then(r => send(r)).catch(e => send({ success: false, error: e.message }));
+  }
+
+  const ctx = (msg.context || []).slice(-2);
+  const job = translate(text, ctx, s).then(result => {
+    cache.set(key, { text: result, ts: Date.now() });
+    saveCache();
+    return { success: true, translatedText: result, settings: s };
+  });
+
+  pending.set(key, job);
+  job.then(r => send(r)).catch(e => send({ success: false, error: e.message })).finally(() => pending.delete(key));
 }
 
 async function getSettings() {
-  const [syncValues, localValues] = await Promise.all([
+  const [sync, local] = await Promise.all([
     chrome.storage.sync.get(SYNC_DEFAULTS),
     chrome.storage.local.get(LOCAL_DEFAULTS)
   ]);
-  return {
-    ...SYNC_DEFAULTS,
-    ...LOCAL_DEFAULTS,
-    ...syncValues,
-    ...localValues
+  return { ...SYNC_DEFAULTS, ...LOCAL_DEFAULTS, ...sync, ...local };
+}
+
+async function translate(text, ctx, s) {
+  const prompt = ctx.length ? `[Prev: ${ctx.join(' → ')}]\n` : '';
+  const body = {
+    model: s.model || 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'Translate subtitles precisely. No commentary.' },
+      { role: 'user', content: `${prompt}Translate to ${s.targetLanguage}:\n"${text}"` }
+    ],
+    temperature: 0.2,
+    enable_thinking: s.enableThinking ? true : false
   };
+
+  let url = (s.apiBaseUrl || 'https://api.openai.com').replace(/\/+$/, '');
+  if (!/\/v\d+/.test(url)) url += '/v1';
+  if (!/\/chat\/completions/.test(url)) url += '/chat/completions';
+
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${s.apiKey}` };
+  const extra = parseHeaders(s.customHeaders);
+  Object.assign(headers, extra);
+
+  console.log('[Udemy Translator] Request:', url, body);
+
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const data = await res.json();
+  console.log('[Udemy Translator] Response:', data?.usage);
+
+  if (!res.ok) throw new Error(data?.error?.message || 'REQUEST_FAILED');
+  const translated = data?.choices?.[0]?.message?.content?.trim();
+  if (!translated) throw new Error('EMPTY_TRANSLATION');
+  return translated;
 }
 
-async function translateText({ text, apiKey, targetLanguage, apiBaseUrl, model, context }) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= TRANSLATION_MAX_RETRIES; attempt++) {
-    try {
-      return await performTranslationRequest({ text, apiKey, targetLanguage, apiBaseUrl, model, context });
-    } catch (error) {
-      lastError = error;
-      const shouldRetry = isRetryableTranslationError(error) && attempt < TRANSLATION_MAX_RETRIES;
-      if (!shouldRetry) {
-        throw normalizeTranslationError(error);
-      }
-      await delay(TRANSLATION_RETRY_DELAY_MS * attempt);
-    }
+function parseHeaders(str) {
+  if (!str) return {};
+  const out = {};
+  for (const line of str.split('\n')) {
+    const i = line.indexOf(':');
+    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
   }
-  throw normalizeTranslationError(lastError);
+  return out;
 }
 
-async function performTranslationRequest({ text, apiKey, targetLanguage, apiBaseUrl, model, context }) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort('REQUEST_TIMEOUT'), TRANSLATION_TIMEOUT_MS);
-
-  try {
-    const contextLines = Array.isArray(context) ? context.filter(Boolean) : [];
-    const contextBlock = contextLines.length ? `Context:\n${contextLines.join('\n')}\n\n` : '';
-    const prompt = `Translate the following subtitle line into ${targetLanguage}. Provide translation only.\n\n${contextBlock}Subtitle:\n${text}`;
-
-    let endpoint = (apiBaseUrl || 'https://api.openai.com').trim();
-    if (!/^https?:\/\//i.test(endpoint)) {
-      endpoint = 'https://api.openai.com';
-    }
-    endpoint = endpoint.replace(/\/+$/, '');
-    if (/\/(chat\/completions|responses)(?:\/|$)/i.test(endpoint)) {
-      // already points to a full endpoint such as /v1/chat/completions or /v1/responses
-    } else if (/\/v\d+$/i.test(endpoint)) {
-      endpoint = `${endpoint}/chat/completions`;
-    } else {
-      endpoint = `${endpoint}/v1/chat/completions`;
-    }
-    const modelName = model || 'gpt-4o-mini';
-
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: modelName,
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a precise subtitle translator. Keep timing subtleties and concise language. Avoid adding commentary.'
-          },
-          {
-            role: 'user',
-            content: prompt
-          }
-        ],
-        temperature: 0.2,
-        max_tokens: 200
-      }),
-      thinking: {
-        type: 'disabled'
-      },
-      signal: controller.signal
-    });
-
-    if (!response.ok) {
-      const errorPayload = await safeJson(response);
-      const reason = errorPayload?.error?.message || response.statusText || 'REQUEST_FAILED';
-      throw new Error(reason);
-    }
-
-    const data = await response.json();
-    const translated = data?.choices?.[0]?.message?.content?.trim();
-    if (!translated) {
-      throw new Error('EMPTY_TRANSLATION');
-    }
-    return translated;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function safeJson(response) {
-  try {
-    return await response.json();
-  } catch (error) {
-    return null;
-  }
-}
-
-function enqueueJob(job) {
-  jobQueue.push(job);
-  pumpQueue();
-}
-
-function pumpQueue() {
-  while (activeJobs < currentConcurrency && jobQueue.length) {
-    const job = jobQueue.shift();
-    activeJobs++;
-    runJob(job);
-  }
-}
-
-async function runJob(job) {
-  try {
-    const translated = await translateText(job);
-    job.resolve(translated);
-  } catch (error) {
-    job.reject(error);
-  } finally {
-    activeJobs = Math.max(0, activeJobs - 1);
-    pumpQueue();
-  }
-}
-
-function updateConcurrency(limit) {
-  const sanitized = sanitizeConcurrency(limit);
-  if (sanitized !== currentConcurrency) {
-    currentConcurrency = sanitized;
-    pumpQueue();
-  }
-}
-
-function sanitizeConcurrency(value) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) {
-    return SYNC_DEFAULTS.concurrencyLimit;
-  }
-  return Math.min(Math.max(Math.round(num), 1), 8);
-}
-
-function buildCacheKey({ text, targetLanguage, model, apiBaseUrl }) {
-  return [
-    targetLanguage || '',
-    model || '',
-    apiBaseUrl || '',
-    text || ''
-  ].join('::');
-}
-
-async function ensureCacheLoaded() {
-  if (cacheInitialized) return;
-  try {
-    const stored = await chrome.storage.local.get(CACHE_STORAGE_KEY);
-    const data = stored?.[CACHE_STORAGE_KEY];
-    const now = Date.now();
-    if (data && typeof data === 'object') {
-      for (const [key, entry] of Object.entries(data)) {
-        if (
-          entry &&
-          typeof entry.translation === 'string' &&
-          typeof entry.timestamp === 'number' &&
-          now - entry.timestamp <= CACHE_TTL_MS
-        ) {
-          translationCache.set(key, {
-            translation: entry.translation,
-            timestamp: entry.timestamp
-          });
-        }
-      }
-    }
-  } catch (error) {
-    console.warn('[Udemy Translator] Failed to load cache', error);
-  } finally {
-    cacheInitialized = true;
-  }
-}
-
-function getCachedTranslation(key) {
-  const entry = translationCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
-    translationCache.delete(key);
-    scheduleCacheSave();
-    return null;
-  }
-  return entry.translation;
-}
-
-function rememberCacheEntry(key, translation) {
-  if (!translation) return;
-  translationCache.set(key, {
-    translation,
-    timestamp: Date.now()
-  });
-  scheduleCacheSave();
-}
-
-function scheduleCacheSave() {
-  if (!cacheInitialized) return;
-  if (cacheSaveTimer) {
-    clearTimeout(cacheSaveTimer);
-  }
-  cacheSaveTimer = setTimeout(() => {
-    cacheSaveTimer = null;
-    saveCacheToStorage().catch(error => {
-      console.warn('[Udemy Translator] Failed to persist cache', error);
-    });
-  }, CACHE_SAVE_DEBOUNCE_MS);
-}
-
-async function saveCacheToStorage() {
-  await ensureCacheLoaded();
+async function loadCache() {
+  if (cacheLoaded) return;
+  const stored = await chrome.storage.local.get(CACHE_KEY);
   const now = Date.now();
-  const payload = {};
-
-  for (const [key, entry] of translationCache.entries()) {
-    if (now - entry.timestamp <= CACHE_TTL_MS) {
-      payload[key] = entry;
-    } else {
-      translationCache.delete(key);
+  if (stored[CACHE_KEY]) {
+    for (const [k, v] of Object.entries(stored[CACHE_KEY])) {
+      if (now - v.ts < CACHE_TTL) cache.set(k, v);
     }
   }
-
-  if (Object.keys(payload).length) {
-    await chrome.storage.local.set({ [CACHE_STORAGE_KEY]: payload });
-  } else {
-    await chrome.storage.local.remove(CACHE_STORAGE_KEY);
-  }
+  cacheLoaded = true;
 }
 
-async function clearTranslationCache() {
-  await ensureCacheLoaded();
-  translationCache.clear();
-  if (cacheSaveTimer) {
-    clearTimeout(cacheSaveTimer);
-    cacheSaveTimer = null;
+function saveCache() {
+  const payload = {};
+  const now = Date.now();
+  for (const [k, v] of cache.entries()) {
+    if (now - v.ts < CACHE_TTL) payload[k] = v;
   }
-  await chrome.storage.local.remove(CACHE_STORAGE_KEY);
+  chrome.storage.local.set({ [CACHE_KEY]: payload });
 }
 
-function isRetryableTranslationError(error) {
-  if (!error) return false;
-  if (error.name === 'AbortError') {
-    return true;
-  }
-  const message = String(error.message || '').toLowerCase();
-  return (
-    message.includes('network') ||
-    message.includes('timeout') ||
-    message.includes('temporarily unavailable') ||
-    message.includes('rate limit') ||
-    message.includes('fetch')
-  );
-}
-
-function normalizeTranslationError(error) {
-  if (!error) {
-    return new Error('TRANSLATION_FAILED');
-  }
-  if (error.name === 'AbortError' || String(error.message || '').toLowerCase().includes('aborted')) {
-    return new Error('REQUEST_TIMEOUT');
-  }
-  return error instanceof Error ? error : new Error(String(error));
-}
-
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function clamp(v, min, max) {
+  const n = Math.round(Number(v) || min);
+  return Math.min(Math.max(n, min), max);
 }

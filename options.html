@@ -44,6 +44,18 @@
               Customize if you are using a proxy or Azure OpenAI endpoint. Leave it as the host to call <code>/v1/chat/completions</code>, or provide a full endpoint path if required.
             </small>
           </label>
+          <label class="field">
+            <span class="field__label">Custom Headers</span>
+            <textarea
+              id="customHeaders"
+              name="customHeaders"
+              placeholder="X-Header-Name: header-value"
+              rows="3"
+            ></textarea>
+            <small class="field__help">
+              Optional extra HTTP headers, one per line in format <code>Header-Name: value</code>. Useful for disabling thinking mode, e.g. <code>X-Api-Feature: no-thinking</code>
+            </small>
+          </label>
           <button type="button" id="clear-key" class="ghost">Remove Stored Key</button>
         </section>
 
@@ -82,6 +94,11 @@
           <label class="field field--checkbox">
             <input type="checkbox" id="translateTranscript" name="translateTranscript" />
             <span>Translate transcript panel entries</span>
+          </label>
+
+          <label class="field field--checkbox">
+            <input type="checkbox" id="enableThinking" name="enableThinking" />
+            <span>Enable thinking mode (uses more tokens)</span>
           </label>
 
           <label class="field">
